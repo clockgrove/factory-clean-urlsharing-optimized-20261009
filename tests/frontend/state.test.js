@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createState, transition, savedView, queryParams, canPaginate, announcement} from '../../public/state.js';
+import {createState, transition, savedView, queryParams, canPaginate, announcement, addressIntent, normalizeIntent} from '../../public/state.js';
 // Completion events are component inputs, not HTTP response fixtures.
 const result = (state, page = 1, totalPages = 4) => {
   state = transition(state, {type: 'result:start'});
@@ -116,4 +116,36 @@ test('export retry invalidates prior writers and retains the current filter and 
   for (const type of ['export:failure', 'export:finish', 'export:success']) assert.equal(transition(s, {type, token: old, error: 'old'}), s);
   assert.equal(queryParams(s.intent, {pagination: false}).get('q'), 'CSV');
   assert.equal(queryParams(s.intent, {pagination: false}).get('sort'), 'severity');
+});
+
+test('address codec preserves full normalized intent and safely repairs malformed values', () => {
+  const intent = normalizeIntent({q: 'a&b=+?# café 日本語', service: ['Search', 'Billing'], status: ['open', 'resolved'], severity: ['high', 'critical'], from: '2024-02-29', to: '2026-06-29', sort: 'severity', direction: 'asc', pageSize: 50, page: 3});
+  assert.deepEqual(addressIntent(queryParams(intent).toString()), intent);
+  assert.deepEqual(addressIntent(''), createState().intent);
+  const malformed = addressIntent('?q=first&q=second&service=no&service=Billing&from=2026-02-30&to=garbage&sort=no&direction=no&page=1e2&pageSize=050');
+  assert.deepEqual(malformed, {...createState().intent, q: 'first', service: ['Billing']});
+  for (const search of ['from=2026-06-29&to=2026-04-01', 'from=2025-02-29&to=2026-13-01']) {
+    assert.equal(addressIntent(search).from, ''); assert.equal(addressIntent(search).to, '');
+  }
+  for (const page of ['0', '-1', 'Infinity', '9007199254740992', '01', '2.5']) assert.equal(addressIntent(`page=${page}`).page, 1);
+});
+test('address restoration preserves page and supersedes all writers through newer failure and retry', () => {
+  let s = result(createState()); const snapshot = s.result;
+  s = transition(s, {type: 'result:start'});
+  s = transition(s, {type: 'detail:select', id: 'A'}); s = transition(s, {type: 'detail:start'});
+  s = transition(s, {type: 'export:start'});
+  const old = {result: s.resultOp.token, detail: s.detail.token, export: s.exportOp.token};
+  s = transition(s, {type: 'address', intent: addressIntent('q=restored&page=3&pageSize=50')});
+  assert.equal(s.intent.page, 3); assert.equal(s.detail.id, null); assert.equal(s.result, snapshot);
+  s = transition(s, {type: 'result:start'}); const restored = s.resultOp.token;
+  s = transition(s, {type: 'intent', patch: {q: 'newer'}});
+  s = transition(s, {type: 'result:start'}); const failed = s.resultOp.token;
+  s = transition(s, {type: 'result:failure', token: failed, error: 'Current failure'});
+  for (const [operation, token] of Object.entries(old)) for (const ending of ['success', 'failure', 'finish']) assert.equal(transition(s, {type: `${operation}:${ending}`, token, data: {page: 99}, error: 'obsolete'}), s);
+  for (const ending of ['success', 'failure', 'finish']) assert.equal(transition(s, {type: `result:${ending}`, token: restored, data: {page: 99}, error: 'obsolete'}), s);
+  assert.equal(announcement(s), 'Current failure'); assert.equal(s.intent.page, 1);
+  s = transition(s, {type: 'result:start'});
+  assert.equal(transition(s, {type: 'result:finish', token: failed}), s);
+  s = transition(s, {type: 'result:success', token: s.resultOp.token, data: {page: 1, total: 0, totalPages: 0}});
+  assert.equal(announcement(s), '0 matching incidents.');
 });

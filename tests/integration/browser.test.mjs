@@ -64,15 +64,15 @@ test('real Chromium: correctness, persisted views, keyboard, phone and overlappi
     const cdp = await context.newCDPSession(page);
     const throttle = latency => cdp.send('Network.emulateNetworkConditions', {offline: false, latency, downloadThroughput: -1, uploadThroughput: -1});
     await cdp.send('Network.enable');
-    const check = async (options = {}) => {
-      await expect(page.locator('#results')).toHaveAttribute('aria-busy', 'false');
-      await expect(page.locator('#freshness')).toHaveText('Current selections');
+    const check = async (options = {}, target = page) => {
+      await expect(target.locator('#results')).toHaveAttribute('aria-busy', 'false');
+      await expect(target.locator('#freshness')).toHaveText('Current selections');
       const {items, summary} = expected(options);
       const size = options.pageSize || 25, n = options.page || 1;
-      assert.deepEqual(await page.locator('#rows button').evaluateAll(nodes => nodes.map(x => x.dataset.incident)), items.slice((n - 1) * size, n * size).map(x => x.id));
-      assert.deepEqual(await page.locator('#summary strong').allTextContents(), [summary.total, summary.unresolved, summary.highSeverity].map(x => x.toLocaleString()));
-      await expect(page.locator('#chart-text')).toHaveText(summary.openedByDay.length ? summary.openedByDay.map(d => `${d.date}: ${d.count} incident${d.count === 1 ? '' : 's'}`).join('; ') : 'No matching incidents were opened in this range.');
-      await expect(page.locator('#page-label')).toHaveText(items.length ? `Page ${n} of ${Math.ceil(items.length / size)} · ${items.length.toLocaleString()} incidents` : '0 incidents · no pages');
+      assert.deepEqual(await target.locator('#rows button').evaluateAll(nodes => nodes.map(x => x.dataset.incident)), items.slice((n - 1) * size, n * size).map(x => x.id));
+      assert.deepEqual(await target.locator('#summary strong').allTextContents(), [summary.total, summary.unresolved, summary.highSeverity].map(x => x.toLocaleString()));
+      await expect(target.locator('#chart-text')).toHaveText(summary.openedByDay.length ? summary.openedByDay.map(d => `${d.date}: ${d.count} incident${d.count === 1 ? '' : 's'}`).join('; ') : 'No matching incidents were opened in this range.');
+      await expect(target.locator('#page-label')).toHaveText(items.length ? `Page ${n} of ${Math.ceil(items.length / size)} · ${items.length.toLocaleString()} incidents` : '0 incidents · no pages');
     };
     const search = async q => { await page.getByLabel('Search ID, title or description').fill(q); await page.getByLabel('Search ID, title or description').press('Enter'); };
     const clear = async () => { await page.getByRole('button', {name: 'Clear search and filters', exact: true}).click(); };
@@ -114,11 +114,89 @@ test('real Chromium: correctness, persisted views, keyboard, phone and overlappi
       for (const facet of ['status', 'severity']) for (const value of options[facet]) await page.locator(`#${facet}`).getByLabel(human(value), {exact: true}).check();
       await page.getByLabel('From (inclusive)').fill(options.from); await page.getByLabel('To (inclusive)').fill(options.to); await check(options);
       await page.getByLabel('Name this view').fill('Billing retry'); await page.getByRole('button', {name: 'Save current view'}).click();
-      await page.reload(); await check(); await page.getByRole('button', {name: 'Open saved view Billing retry'}).click(); await check(options);
+      await page.reload(); await check(options); await page.getByRole('button', {name: 'Open saved view Billing retry'}).click(); await check(options);
       await expect(page.getByLabel('Search ID, title or description')).toHaveValue('retry'); await expect(page.locator('#service').getByLabel('Billing', {exact: true})).toBeChecked();
       for (const facet of ['service', 'status', 'severity']) for (const value of options[facet]) await expect(page.locator(`#${facet}`).getByLabel(human(value), {exact: true})).toBeChecked();
       for (const [label, value] of [['From (inclusive)', options.from], ['To (inclusive)', options.to], ['Sort by', options.sort], ['Order', options.direction], ['Rows per page', '50']]) await expect(page.getByLabel(label, {exact: true})).toHaveValue(value);
-      await page.getByRole('button', {name: 'Delete saved view Billing retry'}).click(); await page.reload(); await check(); await expect(page.locator('#views')).toHaveText('No saved views yet.');
+      await page.getByRole('button', {name: 'Delete saved view Billing retry'}).click(); await page.reload(); await check(options); await expect(page.locator('#views')).toHaveText('No saved views yet.');
+    });
+    await t.test('copied addresses, fresh tabs, reload, normalization and page clamps', async () => {
+      const base = `http://127.0.0.1:${port}`;
+      const options = {q: 'incident', service: ['Billing', 'Search'], status: ['open', 'resolved'], severity: ['critical', 'high'], from: '2026-04-01', to: '2026-06-29', sort: 'severity', direction: 'asc', pageSize: 50, page: 2};
+      const params = new URLSearchParams();
+      for (const [key, value] of Object.entries(options)) for (const item of Array.isArray(value) ? value : [value]) params.append(key, item);
+      await page.goto(`${base}?${params}`); await check(options);
+      const copied = page.url();
+      const fresh = await context.newPage(); fresh.setDefaultTimeout(10000);
+      try {
+        await fresh.goto(copied); await check(options, fresh);
+        await fresh.reload(); await check(options, fresh);
+        for (const [key, value] of Object.entries(options)) {
+          if (Array.isArray(value)) for (const item of value) await expect(fresh.locator(`#${key} input[value="${item}"]`)).toBeChecked();
+          else if (key !== 'page') await expect(fresh.locator(`#${key === 'q' ? 'search' : key === 'pageSize' ? 'page-size' : key}`)).toHaveValue(String(value));
+        }
+        await expect(fresh.locator('#detail')).not.toBeVisible();
+      } finally { await fresh.close(); }
+      await page.reload(); await check(options);
+      await page.getByLabel('Name this view').fill('Shared page'); await page.getByRole('button', {name: 'Save current view'}).click();
+      await page.getByRole('button', {name: 'Open saved view Shared page'}).click(); await check({...options, page: 1});
+      await page.getByRole('button', {name: 'Delete saved view Shared page'}).click();
+      for (const q of ['a&b=+?# café 日本語', '"retry, then continue"']) {
+        await search(q); await check({...options, q, page: 1});
+        const link = page.url(); assert.equal(new URL(link).searchParams.get('q'), q);
+        await page.goto(link); await check({...options, q, page: 1}); await expect(page.locator('#search')).toHaveValue(q);
+      }
+      for (const malformed of ['?from=2026-02-30&to=2026-13-01&service=bogus&sort=bogus&direction=bogus&page=-2&pageSize=75', '?from=2026-06-29&to=2026-04-01', '?page=9007199254740992']) {
+        await page.goto(base + malformed); await check();
+        await expect(page.locator('#from')).toHaveValue(''); await expect(page.locator('#to')).toHaveValue('');
+      }
+      await page.goto(`${base}?q=incident&q=ignored&service=Billing&service=bogus&service=Search`); await check({q: 'incident', service: ['Billing', 'Search']});
+      assert.deepEqual(new URL(page.url()).searchParams.getAll('q'), ['incident']);
+      await page.goto(`${base}?q=inc-000001&page=999`); await check({q: 'inc-000001'});
+      assert.equal(new URL(page.url()).searchParams.get('page'), '1');
+      await page.goto(base); await check();
+    });
+    await t.test('Back and Forward own focused controls, pending work and genuine failure retry', async () => {
+      await search('Billing'); await check({q: 'Billing'});
+      await page.getByRole('button', {name: 'Next', exact: true}).click(); await check({q: 'Billing', page: 2});
+      const billingAddress = page.url();
+      await search('Uploads'); await check({q: 'Uploads'});
+      await page.locator('#search').fill('unsent draft');
+      await page.goBack(); await check({q: 'Billing', page: 2});
+      await expect(page.locator('#search')).toHaveValue('Billing'); await expect(page.locator('#search')).toBeFocused();
+      await page.goForward(); await check({q: 'Uploads'}); await expect(page.locator('#search')).toHaveValue('Uploads');
+      await throttle(900);
+      let downloads = 0; const downloaded = () => downloads++; page.on('download', downloaded);
+      try {
+        const exportRequest = page.waitForRequest(r => r.url().includes('/api/export.csv'));
+        await page.locator('#export').click(); await exportRequest;
+        const detailRequest = page.waitForRequest(r => r.url().includes('/api/incidents/INC-'));
+        await page.locator('#rows button').first().click(); await detailRequest;
+        await page.goBack(); await check({q: 'Billing', page: 2});
+        await expect(page.locator('#detail')).not.toBeVisible();
+        await expect(page.locator('#export-message')).toHaveText(''); assert.equal(downloads, 0);
+        assert.equal(page.url(), billingAddress);
+        const pending = page.waitForRequest(r => r.url().includes('/api/incidents?') && new URL(r.url()).searchParams.get('q') === 'Search');
+        await search('Search'); await pending;
+        await page.goBack(); await page.goForward();
+        await expect(page.locator('#results')).toHaveAttribute('aria-busy', 'true');
+        await page.locator('#search').fill('draft during completion');
+        await check({q: 'Search'});
+        await expect(page.locator('#search')).toHaveValue('draft during completion');
+        await stop(); await page.goBack();
+        await expect(page.locator('#result-message button')).toHaveText('Retry');
+        await expect(page.locator('#search')).toHaveValue('Billing');
+        await page.goForward(); await expect(page.locator('#result-message button')).toHaveText('Retry');
+        await expect(page.locator('#search')).toHaveValue('Search');
+        const failedAddress = page.url(), historyLength = await page.evaluate(() => history.length);
+        await start(); await throttle(0); await page.locator('#result-message button').click(); await check({q: 'Search'});
+        assert.equal(page.url(), failedAddress);
+        assert.equal(await page.evaluate(() => history.length), historyLength);
+        await search('Search'); await check({q: 'Search'});
+        assert.equal(await page.evaluate(() => history.length), historyLength);
+        await page.goBack(); await check({q: 'Billing', page: 2});
+        await clear(); await check();
+      } finally { page.off('download', downloaded); await throttle(0); }
     });
     await t.test('keyboard details expose all fields, focus and results return; phone controls fit', async () => {
       await search('inc-000001'); await check({q: 'inc-000001'});

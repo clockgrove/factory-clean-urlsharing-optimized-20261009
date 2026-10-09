@@ -1,11 +1,11 @@
-import {createState, transition, queryParams, savedView, announcement, isResultCurrent, canPaginate} from './state.js';
+import {createState, transition, queryParams, savedView, announcement, isResultCurrent, canPaginate, addressIntent} from './state.js';
 
 const $ = id => document.getElementById(id);
 const node = (tag, text, className) => { const element = document.createElement(tag); if (text !== undefined) element.textContent = text; if (className) element.className = className; return element; };
 const human = value => String(value).replaceAll('_', ' ');
 const utc = value => value ? new Date(value).toISOString().replace('T', ' ').replace('.000Z', ' UTC') : 'Not resolved';
 const facets = {service: ['Accounts', 'Billing', 'Search', 'Uploads', 'Notifications', 'Integrations'], status: ['open', 'in_progress', 'resolved'], severity: ['critical', 'high', 'medium', 'low']};
-let state = createState();
+let state = createState(addressIntent(location.search));
 let resultController, detailController, exportController;
 let returnIncident = null, returnElement = null;
 let renderedResult, renderedBlocked, renderedDetail, renderedIntent;
@@ -16,7 +16,17 @@ try {
   if (Array.isArray(stored)) views = stored.filter(v => v && typeof v.name === 'string' && v.view && typeof v.view === 'object').map(v => ({name: v.name.slice(0, 80), view: savedView(v.view)}));
 } catch { $('storage-message').textContent = 'Saved views could not be read. You can still explore incidents.'; }
 
-function dispatch(event) { const next = transition(state, event); if (next === state) return; state = next; render(); }
+function writeAddress(method) {
+  history[method](null, '', `${location.pathname}?${queryParams(state.intent)}`);
+}
+function dispatch(event) {
+  const next = transition(state, event);
+  if (next === state) return;
+  const pageChanged = next.intent.page !== state.intent.page;
+  state = next;
+  if (event.type === 'result:success' && pageChanged) writeAddress('replaceState');
+  render();
+}
 function restoreFocus() {
   const button = [...$('rows').querySelectorAll('button')].find(b => b.dataset.incident === returnIncident);
   const target = button && !button.disabled ? button : returnElement?.isConnected && !returnElement.disabled ? returnElement : $('results');
@@ -31,7 +41,14 @@ function change(event) {
   if (next === state) return;
   $('to').setCustomValidity('');
   resultController?.abort(); detailController?.abort(); exportController?.abort();
-  state = next; render(); loadResults();
+  const changed = queryParams(next.intent).toString() !== queryParams(state.intent).toString();
+  state = next;
+  if (event.type === 'address') {
+    $('search').value = state.intent.q;
+    renderedIntent = null;
+    writeAddress('replaceState');
+  } else if (changed) writeAddress('pushState');
+  render(); loadResults();
 }
 async function checked(response) {
   if (response.ok) return response;
@@ -211,4 +228,6 @@ $('close-detail').addEventListener('click', closeDetail);
 $('detail').addEventListener('cancel', event => { event.preventDefault(); closeDetail(); });
 $('save-form').addEventListener('submit', event => { event.preventDefault(); const name = $('view-name').value.trim(); if (!name) { $('view-name').setCustomValidity('Enter a view name.'); $('view-name').reportValidity(); return; } views.push({name, view: savedView(state.intent)}); persistViews(); renderViews(); $('view-name').value = ''; });
 $('view-name').addEventListener('input', () => $('view-name').setCustomValidity(''));
+window.addEventListener('popstate', () => change({type: 'address', intent: addressIntent(location.search)}));
+writeAddress('replaceState');
 renderViews(); render(); loadResults();

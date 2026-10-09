@@ -6,7 +6,11 @@ export function normalizeIntent(input = {}) {
   const result = {...defaults};
   result.q = typeof x.q === 'string' ? x.q : '';
   for (const key of Object.keys(values)) result[key] = [...new Set(Array.isArray(x[key]) ? x[key].filter(v => values[key].includes(v)) : [])].sort();
-  for (const key of ['from', 'to']) result[key] = typeof x[key] === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(x[key]) ? x[key] : '';
+  for (const key of ['from', 'to']) {
+    const date = typeof x[key] === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(x[key]) ? new Date(`${x[key]}T00:00:00.000Z`) : null;
+    result[key] = date && Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === x[key] ? x[key] : '';
+  }
+  if (result.from && result.to && result.from > result.to) result.from = result.to = '';
   result.sort = x.sort === 'severity' ? 'severity' : 'openedAt';
   result.direction = x.direction === 'asc' ? 'asc' : 'desc';
   result.pageSize = Number(x.pageSize) === 50 ? 50 : 25;
@@ -25,10 +29,20 @@ export function queryParams(intent, {pagination = true} = {}) {
   if (pagination) { params.set('page', x.page); params.set('pageSize', x.pageSize); }
   return params;
 }
+// First scalar wins; unknown keys never reach the backend.
+export function addressIntent(search) {
+  const params = new URLSearchParams(search), input = {};
+  for (const key of ['q', 'from', 'to', 'sort', 'direction']) if (params.has(key)) input[key] = params.get(key);
+  for (const key of Object.keys(values)) input[key] = params.getAll(key);
+  const page = params.get('page');
+  input.page = /^[1-9]\d*$/.test(page || '') ? Number(page) : 1;
+  input.pageSize = params.get('pageSize') === '50' ? 50 : 25;
+  return normalizeIntent(input);
+}
 const operation = token => ({token, pending: false, error: null});
 const emptyDetail = token => ({...operation(token), id: null, data: null});
-export function createState() {
-  return {intent: normalizeIntent(), result: null, resultOp: operation(0), detail: emptyDetail(0), exportOp: operation(0)};
+export function createState(intent) {
+  return {intent: normalizeIntent(intent), result: null, resultOp: operation(0), detail: emptyDetail(0), exportOp: operation(0)};
 }
 export function isResultCurrent(state) {
   return !!state.result && JSON.stringify(state.intent) === JSON.stringify(state.result.intent);
@@ -41,7 +55,11 @@ function changeIntent(state, intent) {
 }
 export function transition(state, event) {
   switch (event.type) {
-    case 'intent': return changeIntent(state, normalizeIntent({...state.intent, ...event.patch, page: 1}));
+    case 'intent': {
+      const intent = normalizeIntent({...state.intent, ...event.patch, page: 1});
+      return JSON.stringify(intent) === JSON.stringify(state.intent) ? state : changeIntent(state, intent);
+    }
+    case 'address': return changeIntent(state, normalizeIntent(event.intent));
     case 'restore': return changeIntent(state, normalizeIntent({...event.view, page: 1}));
     case 'page': {
       if (!canPaginate(state) || !Number.isSafeInteger(event.delta)) return state;
